@@ -1,0 +1,23 @@
+[Unit]
+Description=CPU governor following power profile and AC power
+Wants=tlp-pd.service upower.service
+After=tlp-pd.service upower.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/cachyos-cpu-governor
+ExecStopPost=/usr/local/libexec/cachyos-cpu-governor --restore
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/sys/devices/system/cpu
+
+[Install]
+WantedBy=graphical.target

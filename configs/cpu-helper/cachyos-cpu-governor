@@ -1,0 +1,85 @@
+#!/usr/bin/python3
+"""PPD CPU policy: AC performance, normal balanced, and explicit conservative saver."""
+import glob,sys,signal
+from pathlib import Path
+from gi.repository import Gio,GLib,GLibUnix
+NAME='org.freedesktop.UPower.PowerProfiles'
+OBJ='/org/freedesktop/UPower/PowerProfiles'
+def read(p):
+ try:return Path(p).read_text().strip()
+ except OSError:return ''
+def ac_online():
+ return any(read(p+'/type')=='Mains' and read(p+'/online')=='1' for p in glob.glob('/sys/class/power_supply/*'))
+def policies():
+ return [p for p in sorted(Path('/sys/devices/system/cpu/cpufreq').glob('policy*')) if read(p/'scaling_driver')=='intel_cpufreq']
+def put(path,value):
+ if read(path)!=str(value):Path(path).write_text(str(value))
+def write_governors(governor):
+ changed=[]
+ for p in policies():
+  if governor not in read(p/'scaling_available_governors').split():raise RuntimeError(f'{governor} unavailable on {p.name}')
+  if read(p/'scaling_governor')!=governor:
+   put(p/'scaling_governor',governor);changed.append(p.name)
+ if changed:print(f'governor={governor} policies={",".join(changed)}',flush=True)
+def normal_cpu(governor):
+ put('/sys/devices/system/cpu/intel_pstate/no_turbo',0)
+ for p in policies():
+  put(p/'scaling_min_freq',read(p/'cpuinfo_min_freq'))
+  put(p/'scaling_max_freq',read(p/'cpuinfo_max_freq'))
+ write_governors(governor)
+def saver_cpu():
+ ps=policies()
+ entering=last is None or last[1]!='power-saver' or any(read(p/'scaling_governor')!='conservative' for p in ps)
+ put('/sys/devices/system/cpu/intel_pstate/no_turbo',1)
+ for p in ps:
+  put(p/'scaling_min_freq',800000)
+  put(p/'scaling_max_freq',800000 if entering else 1600000)
+ write_governors('conservative')
+ roots={Path('/sys/devices/system/cpu/cpufreq/conservative')}|{p/'conservative' for p in ps}
+ found=False
+ for root in roots:
+  if not root.is_dir():continue
+  found=True
+  for name,value in [('up_threshold',90),('down_threshold',70),('freq_step',5),('sampling_down_factor',1),('sampling_rate',100000)]:put(root/name,value)
+ if not found:raise RuntimeError('conservative tunables not found')
+ for p in ps:put(p/'scaling_max_freq',1600000)
+if '--restore' in sys.argv:
+ normal_cpu('schedutil');sys.exit(0)
+bus=Gio.bus_get_sync(Gio.BusType.SYSTEM,None)
+pending=0
+last=None
+def apply():
+ global last
+ try:
+  profile=bus.call_sync(NAME,OBJ,'org.freedesktop.DBus.Properties','Get',GLib.Variant('(ss)',(NAME,'ActiveProfile')),GLib.VariantType.new('(v)'),Gio.DBusCallFlags.NONE,2000,None).unpack()[0]
+ except GLib.Error:profile='unavailable'
+ ac=ac_online();governor='conservative' if profile=='power-saver' else ('performance' if ac and profile=='performance' else 'schedutil')
+ if profile=='power-saver':saver_cpu()
+ else:normal_cpu(governor)
+ state=(ac,profile,governor)
+ if state!=last:print(f'AC={ac} PPD={profile} governor={governor}',flush=True);last=state
+ return GLib.SOURCE_REMOVE
+def flush():
+ global pending
+ pending=0
+ return apply()
+def queue(delay=250):
+ global pending
+ if pending:GLib.source_remove(pending)
+ pending=GLib.timeout_add(delay,flush)
+def properties(conn,sender,path,iface,member,parameters,data):
+ target,changed,invalid=parameters.unpack()
+ if (path==OBJ and ('ActiveProfile' in changed or 'ActiveProfile' in invalid)) or (path=='/org/freedesktop/UPower' and ('OnBattery' in changed or 'OnBattery' in invalid)):
+  queue();GLib.timeout_add(1500,apply)
+def owner_changed(conn,sender,path,iface,member,parameters,data):
+ queue(500)
+def sleep_changed(conn,sender,path,iface,member,parameters,data):
+ if not parameters.unpack()[0]:queue(500)
+for name,path in [(NAME,OBJ),('org.freedesktop.UPower','/org/freedesktop/UPower')]:
+ bus.signal_subscribe(name,'org.freedesktop.DBus.Properties','PropertiesChanged',path,None,Gio.DBusSignalFlags.NONE,properties,None)
+bus.signal_subscribe('org.freedesktop.DBus','org.freedesktop.DBus','NameOwnerChanged','/org/freedesktop/DBus',NAME,Gio.DBusSignalFlags.NONE,owner_changed,None)
+bus.signal_subscribe('org.freedesktop.login1','org.freedesktop.login1.Manager','PrepareForSleep','/org/freedesktop/login1',None,Gio.DBusSignalFlags.NONE,sleep_changed,None)
+loop=GLib.MainLoop()
+def stop():loop.quit();return GLib.SOURCE_REMOVE
+for sig in [signal.SIGTERM,signal.SIGINT]:GLibUnix.signal_add(GLib.PRIORITY_DEFAULT,sig,stop)
+apply();loop.run()
